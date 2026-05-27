@@ -3,6 +3,7 @@
 Нове у v2: cookies, /autoplay, /history, пагінація черги кнопками,
            мультиселект у /search, /nightcore, /bassboost,
            кешування stream URL, семафор yt-dlp запитів
+Нове у v2.1: /radio з кнопками вибору станцій, кнопка ❓ Допомога
 """
 
 import discord
@@ -11,28 +12,38 @@ import yt_dlp
 import random
 import time
 import re
+import os
+from dotenv import load_dotenv
 from discord.ext import commands
 from discord import app_commands, ui, ButtonStyle
 from typing import Optional, List
 
+load_dotenv()
+
 # ─── Токен та налаштування ───────────────────────────────────────────────────
-import os
 TOKEN = os.environ.get('DISCORD_TOKEN')
 PREFIX = '!'
 INACTIVITY_TIMEOUT = 300  # 5 хвилин без музики → відключення
 
-# ─── COOKIES (v2) ─────────────────────────────────────────────────────────────
-# За замовчуванням вимкнено.
-#
-# Варіант А — браузер (тільки якщо бот на тому ж ПК і браузер ЗАКРИТИЙ):
-#   COOKIE_BROWSER = 'firefox'  # firefox не блокує базу; chrome — блокує
-#
-# Варіант Б — файл cookies.txt (рекомендовано для Railway/VPS):
-#   1. Розширення "Get cookies.txt LOCALLY" → відкрий youtube.com → Export
-#   2. Збережи як cookies.txt поряд з ботом
-#   3. COOKIE_FILE = 'cookies.txt'
+# ─── COOKIES ──────────────────────────────────────────────────────────────────
 COOKIE_BROWSER: Optional[str] = None
-COOKIE_FILE:    Optional[str] = None  # наприклад 'cookies.txt'
+COOKIE_FILE:    Optional[str] = None
+
+# ─── РАДІОСТАНЦІЇ ─────────────────────────────────────────────────────────────
+RADIO_STATIONS = {
+    'NRJ Ukraine':   'https://stream.rcs.revma.com/an1ugyygzk8uv',
+    'Радіо Рекорд':  'https://radiorecord.hostingradio.ru/record96.aacp',
+    'Europa Plus':   'https://ep256.hostingradio.ru:8052/europaplus256.mp3',
+    'Мелодія FM':    'https://online.melodiafm.ua/melodia',
+    'Хіт FM':        'https://online.hitfm.ua/HitFM',
+    'Radio ROKS':    'https://online.radioroks.ua/RadioROKS',
+    'Авторадіо':     'https://icecast.radiogroup.com.ua:8443/avto96',
+}
+
+RADIO_FFMPEG_OPTIONS = {
+    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    'options': '-vn',
+}
 
 # ─── YT-DLP налаштування ─────────────────────────────────────────────────────
 def _build_ytdl_base() -> dict:
@@ -78,18 +89,13 @@ FFMPEG_OPTIONS = {
 ytdl        = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 ytdl_search = yt_dlp.YoutubeDL(YTDL_SEARCH_OPTIONS)
 
-# ─── Семафор і кеш (захист від флуду YouTube) ────────────────────────────────
-# Максимум 5 одночасних запитів до YouTube через yt-dlp
+# ─── Семафор і кеш ────────────────────────────────────────────────────────────
 _ytdl_semaphore: asyncio.Semaphore = asyncio.Semaphore(5)
-
-# Кеш stream URL: {webpage_url: (stream_url, expire_timestamp)}
-# Stream URL від YouTube живе ~6 годин, зберігаємо 2 години про всяк випадок
 _url_cache: dict[str, tuple[str, float]] = {}
-CACHE_TTL = 7200  # секунди (2 години)
+CACHE_TTL = 7200
 
 
 async def _ytdl_extract(url: str, **kwargs) -> Optional[dict]:
-    """Виконати yt-dlp запит через семафор — не більше 5 одночасно."""
     loop = asyncio.get_event_loop()
     async with _ytdl_semaphore:
         try:
@@ -102,23 +108,13 @@ async def _ytdl_extract(url: str, **kwargs) -> Optional[dict]:
 
 
 async def _get_stream_url(webpage_url: str) -> Optional[str]:
-    """
-    Повернути stream URL для треку.
-    Спочатку перевіряє кеш — якщо є свіжий URL, запит до YouTube не робиться.
-    """
     now = time.time()
-
-    # Перевірити кеш
     if webpage_url in _url_cache:
         stream_url, expires = _url_cache[webpage_url]
         if now < expires:
-            print(f'[cache] HIT {webpage_url[:60]}')
             return stream_url
         else:
-            del _url_cache[webpage_url]  # застарілий — видалити
-
-    # Кеш промах — запит до YouTube
-    print(f'[cache] MISS {webpage_url[:60]}')
+            del _url_cache[webpage_url]
     data = await _ytdl_extract(webpage_url)
     if not data:
         return None
@@ -127,19 +123,10 @@ async def _get_stream_url(webpage_url: str) -> Optional[str]:
         data = entries[0] if entries else None
     if not data:
         return None
-
     stream_url = data.get('url')
     if stream_url:
         _url_cache[webpage_url] = (stream_url, now + CACHE_TTL)
-
     return stream_url
-
-
-def _cache_stats() -> str:
-    """Повернути коротку статистику кешу для /help."""
-    now   = time.time()
-    alive = sum(1 for _, exp in _url_cache.values() if now < exp)
-    return f'{alive} URL в кеші'
 
 
 # ─── Кольори ──────────────────────────────────────────────────────────────────
@@ -150,7 +137,7 @@ COLOR_YELLOW = 0xFEE75C
 COLOR_PURPLE = 0x9B59B6
 COLOR_CYAN   = 0x1ABC9C
 
-# ─── Аудіофільтри (v2) ────────────────────────────────────────────────────────
+# ─── Аудіофільтри ────────────────────────────────────────────────────────────
 class AudioFilter:
     NONE      = 'none'
     BASSBOOST = 'bassboost'
@@ -162,7 +149,6 @@ FILTER_LABELS = {
     AudioFilter.NIGHTCORE: ('⚡ Nightcore',    COLOR_CYAN),
 }
 
-# FFmpeg -af рядки для кожного фільтру
 FILTER_AF = {
     AudioFilter.NONE:      '',
     AudioFilter.BASSBOOST: 'bass=g=15,dynaudnorm=f=200',
@@ -241,11 +227,9 @@ class Track:
 
 # ─── Функції отримання інформації ─────────────────────────────────────────────
 async def fetch_track(query: str, requester: discord.Member, loop=None) -> Optional[Track]:
-    # Пошук через семафор — не більше 5 одночасних запитів
     if not query.startswith(('http://', 'https://')):
         query = f'ytsearch1:{query}'
     else:
-        # Прибрати list=RD..., list=LL, list=WL тощо — щоб не тягнути цілий мікс
         query = clean_url(query)
     data = await _ytdl_extract(query)
     if not data:
@@ -255,7 +239,6 @@ async def fetch_track(query: str, requester: discord.Member, loop=None) -> Optio
         if not entries:
             return None
         data = entries[0]
-        # Отримати повну інформацію для першого результату пошуку
         full = await _ytdl_extract(data.get('webpage_url', data.get('url', '')))
         if full:
             data = full
@@ -275,17 +258,11 @@ def is_real_playlist(url: str) -> bool:
 
 
 def clean_url(url: str) -> str:
-    """
-    Прибрати list= з URL якщо це НЕ справжній плейлист.
-    Запобігає завантаженню цілого YouTube Mix замість одного треку.
-    """
     if not url.startswith('http') or is_real_playlist(url):
         return url
-    # Прибрати list= і si= параметри — лишити тільки відео
     url = re.sub(r'[?&]list=[^&]+', '', url)
     url = re.sub(r'[?&]si=[^&]+', '', url)
     url = re.sub(r'[?&]index=[^&]+', '', url)
-    # Почистити хвіст після видалення параметрів
     url = re.sub(r'\?&', '?', url)
     url = url.rstrip('?&')
     return url
@@ -322,7 +299,6 @@ async def fetch_playlist(url: str, requester: discord.Member, loop=None) -> List
 
 
 async def fetch_autoplay_tracks(video_id: str, requester: discord.Member, count: int = 3) -> List[Track]:
-    """(v2) Отримати схожі треки через YouTube Mix (RD плейлист)."""
     if not video_id:
         return []
     mix_url = f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}'
@@ -342,7 +318,7 @@ async def fetch_autoplay_tracks(video_id: str, requester: discord.Member, count:
         if not entry:
             continue
         vid = entry.get('id', '')
-        if vid == video_id:          # пропустити вже зіграний
+        if vid == video_id:
             continue
         web_url = entry.get('webpage_url') or (
             f'https://www.youtube.com/watch?v={vid}' if vid else ''
@@ -361,33 +337,19 @@ async def fetch_autoplay_tracks(video_id: str, requester: discord.Member, count:
 
 
 async def fetch_mix_tracks(query: str, requester: discord.Member, count: int = 10) -> List[Track]:
-    """
-    Отримати треки з YouTube Mix (згенерованого плейлиста).
-    query — відео URL, Mix URL (list=RD...) або пошуковий запит.
-    count — скільки треків додати (1–50).
-    """
     count = max(1, min(count, 50))
     loop  = asyncio.get_event_loop()
-
-    # Крок 1: визначити video_id
     video_id = None
-
-    # Якщо вже є Mix URL з list=RD — витягнути video_id з нього
     rd_match = re.search(r'[?&]list=RD([A-Za-z0-9_-]+)', query)
     if rd_match:
         video_id = rd_match.group(1)
-        # Іноді list=RDMM... або list=RDvideo_id — взяти v= якщо є
         v_match = re.search(r'[?&v=/]v=([A-Za-z0-9_-]{11})', query)
         if v_match:
             video_id = v_match.group(1)
-
-    # Якщо звичайне відео URL
     if not video_id:
         v_match = re.search(r'(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})', query)
         if v_match:
             video_id = v_match.group(1)
-
-    # Якщо пошуковий запит — знайти відео і взяти його id
     if not video_id:
         data = await _ytdl_extract(f'ytsearch1:{query}')
         if data and 'entries' in data:
@@ -396,17 +358,14 @@ async def fetch_mix_tracks(query: str, requester: discord.Member, count: int = 1
                 video_id = entries[0].get('id', '')
         elif data:
             video_id = data.get('id', '')
-
     if not video_id:
         return []
-
-    # Крок 2: завантажити Mix
     mix_url = f'https://www.youtube.com/watch?v={video_id}&list=RD{video_id}'
     opts    = {
         **YTDL_OPTIONS,
         'extract_flat': True,
         'noplaylist':   False,
-        'playlistend':  count + 3,   # +3 про запас (перший може бути самим відео)
+        'playlistend':  count + 3,
     }
     try:
         async with _ytdl_semaphore:
@@ -416,7 +375,6 @@ async def fetch_mix_tracks(query: str, requester: discord.Member, count: int = 1
     except BaseException as e:
         print(f'[mix] помилка: {e}')
         return []
-
     entries = (data.get('entries') or []) if data else []
     tracks  = []
     for entry in entries:
@@ -441,7 +399,6 @@ async def fetch_mix_tracks(query: str, requester: discord.Member, count: int = 1
 
 async def get_audio_source(track: Track, volume: float = 1.0,
                            audio_filter: str = AudioFilter.NONE) -> discord.PCMVolumeTransformer:
-    # Отримати stream URL — спочатку з кешу, потім YouTube
     stream_url = await _get_stream_url(track.webpage_url or track.url)
     if not stream_url:
         raise RuntimeError(f'Не вдалося отримати stream URL для: {track.title}')
@@ -472,25 +429,62 @@ class MusicPlayer:
         self.bot          = bot
 
         self.queue:    List[Track] = []
-        self.history:  List[Track] = []   # (v2) зберігаємо до 50 треків
+        self.history:  List[Track] = []
         self.current:  Optional[Track] = None
         self.loop_mode: int   = LoopMode.OFF
         self.volume:    float = 0.5
-        self.autoplay:  bool  = False     # (v2)
-        self.audio_filter: str = AudioFilter.NONE  # (v2)
+        self.autoplay:  bool  = False
+        self.audio_filter: str = AudioFilter.NONE
         self.now_playing_msg: Optional[discord.Message] = None
+
+        # Радіо
+        self.radio_mode:    bool = False
+        self.radio_url:     str  = ''
+        self.radio_station: str  = ''
+        self.radio_msg: Optional[discord.Message] = None
 
         self._next       = asyncio.Event()
         self._task       = bot.loop.create_task(self._player_loop())
         self._idle_since: Optional[float] = None
 
-    # ── Основний цикл ──────────────────────────────────────────────────────
     async def _player_loop(self):
         await self.bot.wait_until_ready()
 
         while not self.bot.is_closed():
             self._next.clear()
 
+            # ── Режим радіо ──────────────────────────────────────────────────
+            if self.radio_mode and self.radio_url:
+                vc = self.guild.voice_client
+                if not vc or not vc.is_connected():
+                    return
+                try:
+                    source = discord.FFmpegPCMAudio(self.radio_url, **RADIO_FFMPEG_OPTIONS)
+                    vol_source = discord.PCMVolumeTransformer(source, volume=self.volume)
+                except Exception as e:
+                    await self.text_channel.send(
+                        embed=discord.Embed(
+                            description=f'❌ Помилка підключення до радіо: `{e}`',
+                            color=COLOR_RED,
+                        )
+                    )
+                    self.radio_mode = False
+                    continue
+
+                def after_radio(error):
+                    if error:
+                        print(f'[radio] помилка: {error}')
+                    if self.radio_mode:
+                        self.bot.loop.call_soon_threadsafe(self._next.set)
+
+                vc.play(vol_source, after=after_radio)
+                await self._send_radio_now_playing()
+                await self._next.wait()
+                if vc and vc.is_playing():
+                    vc.stop()
+                continue
+
+            # ── Звичайний режим ───────────────────────────────────────────────
             if self.loop_mode == LoopMode.TRACK and self.current:
                 track = self.current
             elif self.queue:
@@ -498,12 +492,10 @@ class MusicPlayer:
                 if self.loop_mode == LoopMode.QUEUE:
                     self.queue.append(track)
             else:
-                # Черга порожня
                 last = self.current
                 self.current = None
                 self._idle_since = time.time()
 
-                # (v2) Autoplay — додати схожі треки
                 if self.autoplay and last and last.video_id:
                     await self.text_channel.send(
                         embed=discord.Embed(
@@ -511,11 +503,7 @@ class MusicPlayer:
                             color=COLOR_CYAN,
                         )
                     )
-                    ap_tracks = await fetch_autoplay_tracks(
-                        last.video_id,
-                        last.requester,
-                        count=3,
-                    )
+                    ap_tracks = await fetch_autoplay_tracks(last.video_id, last.requester, count=3)
                     if ap_tracks:
                         self.queue.extend(ap_tracks)
                         self._next.set()
@@ -556,7 +544,6 @@ class MusicPlayer:
 
             vc.play(source, after=after_playing)
 
-            # (v2) Зберігаємо в history (максимум 50)
             self.history.append(track)
             if len(self.history) > 50:
                 self.history.pop(0)
@@ -573,12 +560,42 @@ class MusicPlayer:
                 await self.now_playing_msg.delete()
             except Exception:
                 pass
+        if self.radio_msg:
+            try:
+                await self.radio_msg.delete()
+            except Exception:
+                pass
+            self.radio_msg = None
         embed = track.make_embed(filter_name=self.audio_filter)
         view  = NowPlayingView(self)
         try:
             self.now_playing_msg = await self.text_channel.send(embed=embed, view=view)
         except Exception as e:
             print(f'[player] Не вдалося надіслати now-playing: {e}')
+
+    async def _send_radio_now_playing(self):
+        if self.now_playing_msg:
+            try:
+                await self.now_playing_msg.delete()
+            except Exception:
+                pass
+            self.now_playing_msg = None
+        if self.radio_msg:
+            try:
+                await self.radio_msg.delete()
+            except Exception:
+                pass
+        embed = discord.Embed(
+            title='📻 Радіо — зараз грає',
+            description=f'## {self.radio_station}',
+            color=COLOR_CYAN,
+        )
+        embed.set_footer(text='Зупинити: /stop • Змінити станцію: /radio')
+        view = RadioNowPlayingView(self)
+        try:
+            self.radio_msg = await self.text_channel.send(embed=embed, view=view)
+        except Exception as e:
+            print(f'[radio] Не вдалося надіслати now-playing: {e}')
 
     async def _auto_disconnect(self):
         vc = self.guild.voice_client
@@ -595,7 +612,6 @@ class MusicPlayer:
                 pass
         await self.destroy()
 
-    # ── Публічні методи ────────────────────────────────────────────────────
     def add(self, track: Track):
         self.queue.append(track)
         if not self.guild.voice_client or not self.guild.voice_client.is_playing():
@@ -632,12 +648,36 @@ class MusicPlayer:
         self.loop_mode = (self.loop_mode + 1) % 3
 
     def set_filter(self, audio_filter: str):
-        """(v2) Змінити аудіофільтр і перезапустити поточний трек."""
         self.audio_filter = audio_filter
         if self.current:
-            # Повернути поточний трек на початок черги і перезапустити
             self.queue.insert(0, self.current)
             self.skip()
+
+    async def start_radio(self, url: str, station_name: str):
+        """Запустити радіо, зупинивши поточне відтворення."""
+        self.radio_mode    = True
+        self.radio_url     = url
+        self.radio_station = station_name
+        vc = self.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop()
+        else:
+            self._next.set()
+
+    async def stop_radio(self):
+        """Зупинити радіо."""
+        self.radio_mode    = False
+        self.radio_url     = ''
+        self.radio_station = ''
+        if self.radio_msg:
+            try:
+                await self.radio_msg.delete()
+            except Exception:
+                pass
+            self.radio_msg = None
+        vc = self.guild.voice_client
+        if vc and vc.is_playing():
+            vc.stop()
 
     async def destroy(self):
         self._task.cancel()
@@ -646,6 +686,66 @@ class MusicPlayer:
                 await self.now_playing_msg.delete()
             except Exception:
                 pass
+        if self.radio_msg:
+            try:
+                await self.radio_msg.delete()
+            except Exception:
+                pass
+
+
+# ─── Допоміжна функція: embed довідки ────────────────────────────────────────
+def make_help_embed() -> discord.Embed:
+    embed = discord.Embed(title='📖 Команди Music Bot', color=COLOR_BLUE)
+    embed.add_field(
+        name='🎵 Відтворення',
+        value=(
+            '`/play [URL або пошук]` — відтворити трек або плейлист\n'
+            '`/search [запит]` — знайти треки (мультивибір до 5)\n'
+            '`/nowplaying` — поточний трек\n'
+            '`/skip` — пропустити\n'
+            '`/pause` — пауза / відновлення\n'
+            '`/stop` — зупинити та відключитись'
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name='📻 Радіо',
+        value=(
+            '`/radio` — показати список радіостанцій\n'
+            '`/radio [URL]` — грати власне радіо за прямим посиланням\n'
+            'Доступні станції: ' + ', '.join(RADIO_STATIONS.keys())
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name='📋 Черга',
+        value=(
+            '`/queue` — показати чергу з кнопками ◀️ ▶️\n'
+            '`/shuffle` — перемішати\n'
+            '`/remove [номер]` — видалити трек\n'
+            '`/clear` — очистити\n'
+            '`/loop` — режим повторення'
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name='✨ Функції',
+        value=(
+            '`/history` — останні 10 зіграних треків\n'
+            '`/autoplay` — авто-додавання схожих треків\n'
+            '`/mix [к-сть] [запит]` — YouTube Mix\n'
+            '`/bassboost` — 🔊 підсилення басів\n'
+            '`/nightcore` — ⚡ прискорення + підвищення тону'
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name='⚙️ Інше',
+        value='`/volume [0-200]` • `/join` • `/leave`\nПрефікс `!` теж працює для всіх команд',
+        inline=False,
+    )
+    embed.set_footer(text='⏱️ Автовідключення через 5 хв простою')
+    return embed
 
 
 # ─── UI: Кнопки Now Playing ───────────────────────────────────────────────────
@@ -741,8 +841,114 @@ class NowPlayingView(ui.View):
             await vc.disconnect()
         await interaction.response.send_message('⏹️ Відтворення зупинено, відключився.', ephemeral=True)
 
+    @ui.button(label='❓ Допомога', style=ButtonStyle.secondary, row=1)
+    async def help_btn(self, interaction: discord.Interaction, button: ui.Button):
+        embed = make_help_embed()
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# ─── (v2) Пагінація черги кнопками ───────────────────────────────────────────
+
+# ─── UI: Кнопки Radio Now Playing ────────────────────────────────────────────
+class RadioNowPlayingView(ui.View):
+    def __init__(self, player: MusicPlayer):
+        super().__init__(timeout=None)
+        self.player = player
+
+    @ui.button(emoji='📻', label='Змінити станцію', style=ButtonStyle.primary, row=0)
+    async def change_station(self, interaction: discord.Interaction, button: ui.Button):
+        view = RadioView(self.player, interaction.user)
+        embed = discord.Embed(
+            title='📻 Оберіть радіостанцію',
+            description='Вибери зі списку або використай `/radio [URL]` для власної станції',
+            color=COLOR_CYAN,
+        )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @ui.button(emoji='🔉', style=ButtonStyle.secondary, row=0)
+    async def vol_down(self, interaction: discord.Interaction, button: ui.Button):
+        vol = max(0.0, self.player.volume - 0.1)
+        self.player.set_volume(vol)
+        await interaction.response.send_message(f'🔉 Гучність: **{int(vol * 100)}%**', ephemeral=True)
+
+    @ui.button(emoji='🔊', style=ButtonStyle.secondary, row=0)
+    async def vol_up(self, interaction: discord.Interaction, button: ui.Button):
+        vol = min(2.0, self.player.volume + 0.1)
+        self.player.set_volume(vol)
+        await interaction.response.send_message(f'🔊 Гучність: **{int(vol * 100)}%**', ephemeral=True)
+
+    @ui.button(label='⏹️ Стоп', style=ButtonStyle.danger, row=0)
+    async def stop(self, interaction: discord.Interaction, button: ui.Button):
+        gid = interaction.guild.id
+        if gid in players:
+            await players[gid].stop_radio()
+        vc = interaction.guild.voice_client
+        if vc:
+            await vc.disconnect()
+        if gid in players:
+            await players[gid].destroy()
+            del players[gid]
+        await interaction.response.send_message('⏹️ Радіо зупинено.', ephemeral=True)
+
+    @ui.button(label='❓ Допомога', style=ButtonStyle.secondary, row=0)
+    async def help_btn(self, interaction: discord.Interaction, button: ui.Button):
+        embed = make_help_embed()
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ─── UI: Вибір радіостанції ───────────────────────────────────────────────────
+class RadioSelect(ui.Select):
+    def __init__(self, player: MusicPlayer, requester: discord.Member):
+        self.player    = player
+        self.requester = requester
+        options = [
+            discord.SelectOption(label=name, value=url, emoji='📻')
+            for name, url in RADIO_STATIONS.items()
+        ]
+        super().__init__(
+            placeholder='Оберіть радіостанцію...',
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        url          = self.values[0]
+        station_name = next((k for k, v in RADIO_STATIONS.items() if v == url), url)
+
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message(
+                '❌ Підключіться до голосового каналу!', ephemeral=True)
+            return
+
+        vc = interaction.guild.voice_client
+        if vc:
+            if vc.channel != interaction.user.voice.channel:
+                await vc.move_to(interaction.user.voice.channel)
+        else:
+            await interaction.user.voice.channel.connect()
+
+        player = await ensure_player(interaction.guild, interaction.channel, interaction.client)
+        await player.start_radio(url, station_name)
+
+        embed = discord.Embed(
+            title='📻 Радіо увімкнено',
+            description=f'## {station_name}',
+            color=COLOR_CYAN,
+        )
+        embed.set_footer(text='Зупинити: /stop • Змінити: /radio')
+        await interaction.response.send_message(embed=embed)
+        self.view.stop()
+
+
+class RadioView(ui.View):
+    def __init__(self, player: MusicPlayer, requester: discord.Member):
+        super().__init__(timeout=60)
+        self.add_item(RadioSelect(player, requester))
+
+    @ui.button(label='Скасувати', style=ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.send_message('📻 Скасовано.', ephemeral=True)
+        self.stop()
+
+
+# ─── Пагінація черги ──────────────────────────────────────────────────────────
 class QueueView(ui.View):
     def __init__(self, player: MusicPlayer, page: int = 0):
         super().__init__(timeout=120)
@@ -786,12 +992,11 @@ class QueueView(ui.View):
         await interaction.response.edit_message(embed=embed, view=self)
 
 
-# ─── (v2) Пошук з мультиселектом ─────────────────────────────────────────────
+# ─── Пошук з мультиселектом ───────────────────────────────────────────────────
 class SearchSelect(ui.Select):
     def __init__(self, results: List[dict], requester: discord.Member):
         self.results   = results
         self.requester = requester
-
         options = []
         for i, r in enumerate(results):
             dur = r.get('duration', 0)
@@ -802,7 +1007,6 @@ class SearchSelect(ui.Select):
                 description=f'{r.get("uploader", "")} • {dur_str}'[:100],
                 value=str(i),
             ))
-        # (v2) max_values=5 — вибір кількох треків одночасно
         super().__init__(
             placeholder='Оберіть один або декілька треків...',
             options=options,
@@ -813,7 +1017,6 @@ class SearchSelect(ui.Select):
     async def callback(self, interaction: discord.Interaction):
         selected_indices = [int(v) for v in self.values]
         await interaction.response.defer()
-
         if not interaction.user.voice or not interaction.user.voice.channel:
             await interaction.followup.send(
                 embed=discord.Embed(
@@ -823,16 +1026,13 @@ class SearchSelect(ui.Select):
                 ephemeral=True,
             )
             return
-
         vc = interaction.guild.voice_client
         if vc:
             if vc.channel != interaction.user.voice.channel:
                 await vc.move_to(interaction.user.voice.channel)
         else:
             await interaction.user.voice.channel.connect()
-
         player = await ensure_player(interaction.guild, interaction.channel, interaction.client)
-
         await interaction.followup.send(
             embed=discord.Embed(
                 description=f'⏳ Завантажую {len(selected_indices)} трек(и)...',
@@ -840,17 +1040,14 @@ class SearchSelect(ui.Select):
             ),
             ephemeral=True,
         )
-
         added  = []
         failed = []
-
         for idx in selected_indices:
             result    = self.results[idx]
             video_url = result.get('webpage_url') or result.get('url') or ''
             if result.get('id') and not video_url.startswith('http'):
                 video_url = f'https://www.youtube.com/watch?v={result["id"]}'
             try:
-                # Через семафор — щоб не флудити YouTube при виборі кількох треків
                 data = await _ytdl_extract(video_url)
                 if data:
                     track = Track(data, self.requester)
@@ -860,7 +1057,6 @@ class SearchSelect(ui.Select):
                     failed.append(result.get('title', '?'))
             except BaseException:
                 failed.append(result.get('title', '?'))
-
         if added:
             lines = '\n'.join(f'✅ **{t.title}** • {t.duration_str}' for t in added)
             embed = discord.Embed(description=lines, color=COLOR_GREEN)
@@ -868,11 +1064,7 @@ class SearchSelect(ui.Select):
             if added[0].thumbnail:
                 embed.set_thumbnail(url=added[0].thumbnail)
             if failed:
-                embed.add_field(
-                    name='❌ Не вдалося додати',
-                    value='\n'.join(failed),
-                    inline=False,
-                )
+                embed.add_field(name='❌ Не вдалося додати', value='\n'.join(failed), inline=False)
             await interaction.followup.send(embed=embed)
         else:
             await interaction.followup.send(
@@ -900,30 +1092,24 @@ def make_queue_embed(player: MusicPlayer, page: int = 0) -> discord.Embed:
     pages    = max(1, (total + per_page - 1) // per_page)
     page     = min(page, pages - 1)
     start    = page * per_page
-
     loop_label, _ = LOOP_LABELS[player.loop_mode]
     filter_label, _ = FILTER_LABELS.get(player.audio_filter, FILTER_LABELS[AudioFilter.NONE])
     ap_label     = '🔄 Autoplay ON' if player.autoplay else ''
-
-    embed = discord.Embed(
-        title=f'📋 Черга — сторінка {page + 1}/{pages}',
-        color=COLOR_PURPLE,
-    )
-
-    if player.current:
+    embed = discord.Embed(title=f'📋 Черга — сторінка {page + 1}/{pages}', color=COLOR_PURPLE)
+    if player.radio_mode:
+        embed.add_field(name='📻 Зараз грає радіо', value=player.radio_station, inline=False)
+    elif player.current:
         t = player.current
-        # Поле "Зараз грає" — ліміт 1024, обрізаємо назву якщо треба
         now_value = (
             f'[{t.title[:80]}]({t.webpage_url}) • {t.duration_str}\n'
             f'{t.progress_bar()} • {t.requester.mention}'
         )
         embed.add_field(name='▶️ Зараз грає', value=now_value[:1024], inline=False)
-
     if total == 0:
         embed.add_field(name='Черга порожня', value='Додайте треки командою `/play`', inline=False)
     else:
         lines  = []
-        budget = 1000  # лишаємо запас до ліміту 1024
+        budget = 1000
         for i, t in enumerate(queue[start:start + per_page], start=start + 1):
             line = f'`{i}.` [{t.title[:45]}]({t.webpage_url}) • {t.duration_str}\n'
             if len(''.join(lines)) + len(line) > budget:
@@ -931,9 +1117,7 @@ def make_queue_embed(player: MusicPlayer, page: int = 0) -> discord.Embed:
                 break
             lines.append(line)
         embed.add_field(name='Наступні треки', value=''.join(lines)[:1024], inline=False)
-
-    footer_parts = [f'{total} треків', loop_label, filter_label,
-                    f'Гучність: {int(player.volume * 100)}%']
+    footer_parts = [f'{total} треків', loop_label, filter_label, f'Гучність: {int(player.volume * 100)}%']
     if ap_label:
         footer_parts.append(ap_label)
     embed.set_footer(text=' • '.join(p for p in footer_parts if p))
@@ -955,14 +1139,9 @@ async def ensure_voice(ctx_or_interaction) -> bool:
         guild  = ctx_or_interaction.guild
         author = ctx_or_interaction.author
         send   = ctx_or_interaction.send
-
     if not author.voice or not author.voice.channel:
-        await send(embed=discord.Embed(
-            description='❌ Спочатку підключіться до голосового каналу!',
-            color=COLOR_RED,
-        ))
+        await send(embed=discord.Embed(description='❌ Спочатку підключіться до голосового каналу!', color=COLOR_RED))
         return False
-
     vc = guild.voice_client
     if vc:
         if vc.channel != author.voice.channel:
@@ -993,36 +1172,24 @@ async def slash_play(interaction: discord.Interaction, query: str):
     if not await ensure_voice(interaction):
         return
     player = await ensure_player(interaction.guild, interaction.channel, bot)
+    if player.radio_mode:
+        await player.stop_radio()
     is_playlist = is_real_playlist(query)
     if not is_playlist:
         query = clean_url(query)
-
     if is_playlist:
-        await interaction.followup.send(
-            embed=discord.Embed(description='⏳ Завантажую плейлист...', color=COLOR_YELLOW)
-        )
+        await interaction.followup.send(embed=discord.Embed(description='⏳ Завантажую плейлист...', color=COLOR_YELLOW))
         tracks = await fetch_playlist(query, interaction.user)
         if not tracks:
-            await interaction.followup.send(
-                embed=discord.Embed(description='❌ Не вдалося завантажити плейлист.', color=COLOR_RED)
-            )
+            await interaction.followup.send(embed=discord.Embed(description='❌ Не вдалося завантажити плейлист.', color=COLOR_RED))
             return
         player.add_many(tracks)
-        await interaction.followup.send(
-            embed=discord.Embed(
-                description=f'✅ Додано **{len(tracks)}** треків з плейлиста до черги!',
-                color=COLOR_GREEN,
-            )
-        )
+        await interaction.followup.send(embed=discord.Embed(description=f'✅ Додано **{len(tracks)}** треків з плейлиста до черги!', color=COLOR_GREEN))
     else:
-        await interaction.followup.send(
-            embed=discord.Embed(description=f'⏳ Шукаю: `{query}`...', color=COLOR_YELLOW)
-        )
+        await interaction.followup.send(embed=discord.Embed(description=f'⏳ Шукаю: `{query}`...', color=COLOR_YELLOW))
         track = await fetch_track(query, interaction.user, loop=bot.loop)
         if not track:
-            await interaction.followup.send(
-                embed=discord.Embed(description='❌ Нічого не знайдено.', color=COLOR_RED)
-            )
+            await interaction.followup.send(embed=discord.Embed(description='❌ Нічого не знайдено.', color=COLOR_RED))
             return
         player.add(track)
         embed = discord.Embed(
@@ -1034,30 +1201,52 @@ async def slash_play(interaction: discord.Interaction, query: str):
         await interaction.followup.send(embed=embed)
 
 
+@bot.tree.command(name='radio', description='📻 Слухати радіо (список станцій або пряме URL)')
+@app_commands.describe(url='Пряме посилання на радіопотік (необов\'язково)')
+async def slash_radio(interaction: discord.Interaction, url: str = None):
+    await interaction.response.defer()
+    if not await ensure_voice(interaction):
+        return
+    player = await ensure_player(interaction.guild, interaction.channel, bot)
+
+    if url:
+        # Пряме URL — грати одразу
+        station_name = url[:50]
+        await player.start_radio(url, station_name)
+        embed = discord.Embed(
+            title='📻 Радіо увімкнено',
+            description=f'**{station_name}**',
+            color=COLOR_CYAN,
+        )
+        embed.set_footer(text='Зупинити: /stop • Змінити: /radio')
+        await interaction.followup.send(embed=embed)
+    else:
+        # Показати список станцій
+        embed = discord.Embed(
+            title='📻 Радіостанції',
+            description='Оберіть станцію зі списку нижче або вкажи `/radio [URL]` для власної:',
+            color=COLOR_CYAN,
+        )
+        for name in RADIO_STATIONS:
+            embed.add_field(name=name, value='​', inline=True)
+        view = RadioView(player, interaction.user)
+        await interaction.followup.send(embed=embed, view=view)
+
+
 @bot.tree.command(name='search', description='🔍 Знайти треки та обрати зі списку (можна кілька)')
 @app_commands.describe(query='Пошуковий запит')
 async def slash_search(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
-    await interaction.followup.send(
-        embed=discord.Embed(description=f'🔍 Шукаю: `{query}`...', color=COLOR_YELLOW)
-    )
+    await interaction.followup.send(embed=discord.Embed(description=f'🔍 Шукаю: `{query}`...', color=COLOR_YELLOW))
     try:
-        data = await bot.loop.run_in_executor(
-            None, lambda: ytdl_search.extract_info(f'ytsearch5:{query}', download=False)
-        )
+        data = await bot.loop.run_in_executor(None, lambda: ytdl_search.extract_info(f'ytsearch5:{query}', download=False))
     except BaseException as e:
-        await interaction.followup.send(
-            embed=discord.Embed(description=f'❌ Помилка пошуку: `{e}`', color=COLOR_RED)
-        )
+        await interaction.followup.send(embed=discord.Embed(description=f'❌ Помилка пошуку: `{e}`', color=COLOR_RED))
         return
-
     entries = [e for e in (data.get('entries') or []) if e][:5]
     if not entries:
-        await interaction.followup.send(
-            embed=discord.Embed(description='❌ Нічого не знайдено.', color=COLOR_RED)
-        )
+        await interaction.followup.send(embed=discord.Embed(description='❌ Нічого не знайдено.', color=COLOR_RED))
         return
-
     embed = discord.Embed(title=f'🔍 Результати для: {query}', color=COLOR_PURPLE)
     for i, e in enumerate(entries, 1):
         dur = e.get('duration', 0)
@@ -1067,7 +1256,6 @@ async def slash_search(interaction: discord.Interaction, query: str):
         uploader = e.get('uploader', '') or e.get('channel', '')
         embed.add_field(name=f'{i}. {title}', value=f'`{uploader}` • ⏱️ {dur_str}', inline=False)
     embed.set_footer(text='Можна вибрати декілька треків одночасно • Спливає через 60 сек')
-
     view = SearchView(entries, interaction.user)
     await interaction.followup.send(embed=embed, view=view)
 
@@ -1076,16 +1264,12 @@ async def slash_search(interaction: discord.Interaction, query: str):
 async def slash_skip(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if not vc or not (vc.is_playing() or vc.is_paused()):
-        await interaction.response.send_message(
-            embed=discord.Embed(description='❌ Зараз нічого не грає!', color=COLOR_RED), ephemeral=True
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='❌ Зараз нічого не грає!', color=COLOR_RED), ephemeral=True)
         return
     gid = interaction.guild.id
     if gid in players:
         players[gid].skip()
-    await interaction.response.send_message(
-        embed=discord.Embed(description='⏭️ Трек пропущено!', color=COLOR_GREEN), ephemeral=True
-    )
+    await interaction.response.send_message(embed=discord.Embed(description='⏭️ Трек пропущено!', color=COLOR_GREEN), ephemeral=True)
 
 
 @bot.tree.command(name='pause', description='⏸️ Поставити на паузу / Зняти з паузи')
@@ -1096,14 +1280,10 @@ async def slash_pause(interaction: discord.Interaction):
         return
     if vc.is_paused():
         vc.resume()
-        await interaction.response.send_message(
-            embed=discord.Embed(description='▶️ Відтворення відновлено!', color=COLOR_GREEN), ephemeral=True
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='▶️ Відтворення відновлено!', color=COLOR_GREEN), ephemeral=True)
     elif vc.is_playing():
         vc.pause()
-        await interaction.response.send_message(
-            embed=discord.Embed(description='⏸️ Відтворення на паузі!', color=COLOR_YELLOW), ephemeral=True
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='⏸️ Відтворення на паузі!', color=COLOR_YELLOW), ephemeral=True)
     else:
         await interaction.response.send_message('❌ Нічого не грає!', ephemeral=True)
 
@@ -1113,24 +1293,23 @@ async def slash_stop(interaction: discord.Interaction):
     gid = interaction.guild.id
     if gid in players:
         players[gid].clear()
-        players[gid].skip()
+        if players[gid].radio_mode:
+            await players[gid].stop_radio()
+        else:
+            players[gid].skip()
         await players[gid].destroy()
         del players[gid]
     vc = interaction.guild.voice_client
     if vc:
         await vc.disconnect()
-    await interaction.response.send_message(
-        embed=discord.Embed(description='⏹️ Зупинено. До побачення!', color=COLOR_RED)
-    )
+    await interaction.response.send_message(embed=discord.Embed(description='⏹️ Зупинено. До побачення!', color=COLOR_RED))
 
 
 @bot.tree.command(name='queue', description='📋 Показати чергу відтворення з кнопками навігації')
 async def slash_queue(interaction: discord.Interaction):
     gid = interaction.guild.id
     if gid not in players:
-        await interaction.response.send_message(
-            embed=discord.Embed(description='❌ Плеєр не запущено!', color=COLOR_RED), ephemeral=True
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='❌ Плеєр не запущено!', color=COLOR_RED), ephemeral=True)
         return
     embed = make_queue_embed(players[gid], page=0)
     view  = QueueView(players[gid], page=0)
@@ -1140,15 +1319,20 @@ async def slash_queue(interaction: discord.Interaction):
 @bot.tree.command(name='nowplaying', description='🎵 Показати поточний трек')
 async def slash_nowplaying(interaction: discord.Interaction):
     gid = interaction.guild.id
-    if gid not in players or not players[gid].current:
-        await interaction.response.send_message(
-            embed=discord.Embed(description='❌ Зараз нічого не грає!', color=COLOR_RED), ephemeral=True
-        )
+    if gid not in players:
+        await interaction.response.send_message(embed=discord.Embed(description='❌ Зараз нічого не грає!', color=COLOR_RED), ephemeral=True)
         return
-    track = players[gid].current
-    embed = track.make_embed(filter_name=players[gid].audio_filter)
-    view  = NowPlayingView(players[gid])
-    await interaction.response.send_message(embed=embed, view=view)
+    p = players[gid]
+    if p.radio_mode:
+        embed = discord.Embed(title='📻 Радіо — зараз грає', description=f'## {p.radio_station}', color=COLOR_CYAN)
+        view  = RadioNowPlayingView(p)
+        await interaction.response.send_message(embed=embed, view=view)
+    elif p.current:
+        embed = p.current.make_embed(filter_name=p.audio_filter)
+        view  = NowPlayingView(p)
+        await interaction.response.send_message(embed=embed, view=view)
+    else:
+        await interaction.response.send_message(embed=discord.Embed(description='❌ Зараз нічого не грає!', color=COLOR_RED), ephemeral=True)
 
 
 @bot.tree.command(name='volume', description='🔊 Встановити гучність (0–200%)')
@@ -1163,9 +1347,7 @@ async def slash_volume(interaction: discord.Interaction, percent: int):
         return
     players[gid].set_volume(percent / 100)
     emoji = '🔇' if percent == 0 else '🔉' if percent < 50 else '🔊'
-    await interaction.response.send_message(
-        embed=discord.Embed(description=f'{emoji} Гучність: **{percent}%**', color=COLOR_GREEN)
-    )
+    await interaction.response.send_message(embed=discord.Embed(description=f'{emoji} Гучність: **{percent}%**', color=COLOR_GREEN))
 
 
 @bot.tree.command(name='shuffle', description='🔀 Перемішати чергу')
@@ -1175,11 +1357,7 @@ async def slash_shuffle(interaction: discord.Interaction):
         await interaction.response.send_message('❌ Плеєр не запущено!', ephemeral=True)
         return
     players[gid].shuffle()
-    await interaction.response.send_message(
-        embed=discord.Embed(
-            description=f'🔀 Чергу перемішано! ({len(players[gid].queue)} треків)', color=COLOR_GREEN
-        )
-    )
+    await interaction.response.send_message(embed=discord.Embed(description=f'🔀 Чергу перемішано! ({len(players[gid].queue)} треків)', color=COLOR_GREEN))
 
 
 @bot.tree.command(name='loop', description='🔁 Переключити режим повторення')
@@ -1202,9 +1380,7 @@ async def slash_remove(interaction: discord.Interaction, position: int):
         return
     track = players[gid].remove(position - 1)
     if track:
-        await interaction.response.send_message(
-            embed=discord.Embed(description=f'🗑️ Видалено: **{track.title}**', color=COLOR_YELLOW)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description=f'🗑️ Видалено: **{track.title}**', color=COLOR_YELLOW))
     else:
         await interaction.response.send_message('❌ Невірний номер треку!', ephemeral=True)
 
@@ -1217,25 +1393,16 @@ async def slash_clear(interaction: discord.Interaction):
         return
     count = len(players[gid].queue)
     players[gid].clear()
-    await interaction.response.send_message(
-        embed=discord.Embed(
-            description=f'🧹 Черга очищена! Видалено **{count}** треків.', color=COLOR_YELLOW
-        )
-    )
+    await interaction.response.send_message(embed=discord.Embed(description=f'🧹 Черга очищена! Видалено **{count}** треків.', color=COLOR_YELLOW))
 
-
-# ─── (v2) НОВІ КОМАНДИ ────────────────────────────────────────────────────────
 
 @bot.tree.command(name='history', description='📜 Показати останні 10 зіграних треків')
 async def slash_history(interaction: discord.Interaction):
     gid = interaction.guild.id
     if gid not in players or not players[gid].history:
-        await interaction.response.send_message(
-            embed=discord.Embed(description='📜 Історія порожня.', color=COLOR_YELLOW), ephemeral=True
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='📜 Історія порожня.', color=COLOR_YELLOW), ephemeral=True)
         return
-
-    history = players[gid].history[-10:][::-1]   # останні 10, найновіший першим
+    history = players[gid].history[-10:][::-1]
     embed   = discord.Embed(title='📜 Нещодавно грали', color=COLOR_BLUE)
     lines   = []
     for i, t in enumerate(history, 1):
@@ -1256,68 +1423,33 @@ async def slash_autoplay(interaction: discord.Interaction):
     desc  = (
         f'🔄 Autoplay: **{state}**\n'
         + ('Після закінчення черги бот автоматично додасть схожі треки з YouTube Mix.'
-           if players[gid].autoplay else
-           'Бот зупиниться після закінчення черги.')
+           if players[gid].autoplay else 'Бот зупиниться після закінчення черги.')
     )
-    await interaction.response.send_message(
-        embed=discord.Embed(description=desc, color=COLOR_GREEN if players[gid].autoplay else COLOR_RED)
-    )
+    await interaction.response.send_message(embed=discord.Embed(description=desc, color=COLOR_GREEN if players[gid].autoplay else COLOR_RED))
 
 
 @bot.tree.command(name='mix', description='🎲 Додати треки з YouTube Mix (авто-генерований плейлист)')
-@app_commands.describe(
-    query='Відео URL, Mix URL або назва пісні',
-    count='Кількість треків (1–50, за замовчуванням 10)',
-)
+@app_commands.describe(query='Відео URL, Mix URL або назва пісні', count='Кількість треків (1–50, за замовчуванням 10)')
 async def slash_mix(interaction: discord.Interaction, query: str, count: int = 10):
     if not (1 <= count <= 50):
-        await interaction.response.send_message(
-            embed=discord.Embed(description='❌ Кількість має бути від 1 до 50!', color=COLOR_RED),
-            ephemeral=True,
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='❌ Кількість має бути від 1 до 50!', color=COLOR_RED), ephemeral=True)
         return
-
     await interaction.response.defer()
     if not await ensure_voice(interaction):
         return
-
     player = await ensure_player(interaction.guild, interaction.channel, bot)
-
-    await interaction.followup.send(
-        embed=discord.Embed(
-            description=f'🎲 Завантажую YouTube Mix ({count} треків)...',
-            color=COLOR_YELLOW,
-        )
-    )
-
+    await interaction.followup.send(embed=discord.Embed(description=f'🎲 Завантажую YouTube Mix ({count} треків)...', color=COLOR_YELLOW))
     tracks = await fetch_mix_tracks(query, interaction.user, count=count)
-
     if not tracks:
-        await interaction.followup.send(
-            embed=discord.Embed(
-                description='❌ Не вдалося завантажити Mix. Спробуй інше відео або запит.',
-                color=COLOR_RED,
-            )
-        )
+        await interaction.followup.send(embed=discord.Embed(description='❌ Не вдалося завантажити Mix. Спробуй інше відео або запит.', color=COLOR_RED))
         return
-
     player.add_many(tracks)
-
-    # Показати перші 5 доданих треків
-    preview = '\n'.join(
-        f'`{i}.` {t.title[:55]}' for i, t in enumerate(tracks[:5], 1)
-    )
+    preview = '\n'.join(f'`{i}.` {t.title[:55]}' for i, t in enumerate(tracks[:5], 1))
     if len(tracks) > 5:
         preview += f'\n`...` і ще {len(tracks) - 5} треків'
-
-    embed = discord.Embed(
-        title=f'🎲 YouTube Mix — додано {len(tracks)} треків',
-        description=preview,
-        color=COLOR_CYAN,
-    )
+    embed = discord.Embed(title=f'🎲 YouTube Mix — додано {len(tracks)} треків', description=preview, color=COLOR_CYAN)
     if tracks[0].thumbnail:
         embed.set_thumbnail(url=tracks[0].thumbnail)
-    embed.set_footer(text=f'На основі: {tracks[0].title[:60]}' if tracks else '')
     await interaction.followup.send(embed=embed)
 
 
@@ -1329,17 +1461,13 @@ async def slash_bassboost(interaction: discord.Interaction):
         return
     if players[gid].audio_filter == AudioFilter.BASSBOOST:
         players[gid].set_filter(AudioFilter.NONE)
-        await interaction.response.send_message(
-            embed=discord.Embed(description='🎵 Bass Boost вимкнено.', color=COLOR_BLUE)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='🎵 Bass Boost вимкнено.', color=COLOR_BLUE))
     else:
         players[gid].set_filter(AudioFilter.BASSBOOST)
-        await interaction.response.send_message(
-            embed=discord.Embed(description='🔊 **Bass Boost увімкнено!** Трек перезапускається...', color=COLOR_PURPLE)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='🔊 **Bass Boost увімкнено!** Трек перезапускається...', color=COLOR_PURPLE))
 
 
-@bot.tree.command(name='nightcore', description='⚡ Увімкнути/вимкнути Nightcore (прискорення + підвищення тону)')
+@bot.tree.command(name='nightcore', description='⚡ Увімкнути/вимкнути Nightcore')
 async def slash_nightcore(interaction: discord.Interaction):
     gid = interaction.guild.id
     if gid not in players:
@@ -1347,14 +1475,10 @@ async def slash_nightcore(interaction: discord.Interaction):
         return
     if players[gid].audio_filter == AudioFilter.NIGHTCORE:
         players[gid].set_filter(AudioFilter.NONE)
-        await interaction.response.send_message(
-            embed=discord.Embed(description='🎵 Nightcore вимкнено.', color=COLOR_BLUE)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='🎵 Nightcore вимкнено.', color=COLOR_BLUE))
     else:
         players[gid].set_filter(AudioFilter.NIGHTCORE)
-        await interaction.response.send_message(
-            embed=discord.Embed(description='⚡ **Nightcore увімкнено!** Трек перезапускається...', color=COLOR_CYAN)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='⚡ **Nightcore увімкнено!** Трек перезапускається...', color=COLOR_CYAN))
 
 
 @bot.tree.command(name='join', description='🔗 Приєднатися до голосового каналу')
@@ -1363,9 +1487,7 @@ async def slash_join(interaction: discord.Interaction):
     if not await ensure_voice(interaction):
         return
     ch = interaction.guild.voice_client.channel
-    await interaction.followup.send(
-        embed=discord.Embed(description=f'✅ Підключився до **{ch.name}**', color=COLOR_GREEN)
-    )
+    await interaction.followup.send(embed=discord.Embed(description=f'✅ Підключився до **{ch.name}**', color=COLOR_GREEN))
 
 
 @bot.tree.command(name='leave', description='👋 Відключитися від голосового каналу')
@@ -1377,56 +1499,14 @@ async def slash_leave(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc:
         await vc.disconnect()
-        await interaction.response.send_message(
-            embed=discord.Embed(description='👋 Відключився!', color=COLOR_YELLOW)
-        )
+        await interaction.response.send_message(embed=discord.Embed(description='👋 Відключився!', color=COLOR_YELLOW))
     else:
         await interaction.response.send_message('❌ Бот не у голосовому каналі!', ephemeral=True)
 
 
-@bot.tree.command(name='help', description='❓ Список команд')
+@bot.tree.command(name='help', description='❓ Список всіх команд бота')
 async def slash_help(interaction: discord.Interaction):
-    embed = discord.Embed(title='📖 Команди Music Bot v2', color=COLOR_BLUE)
-    embed.add_field(
-        name='🎵 Відтворення',
-        value=(
-            '`/play [URL або пошук]` — відтворити трек або плейлист\n'
-            '`/search [запит]` — знайти треки (мультивибір до 5)\n'
-            '`/nowplaying` — поточний трек\n'
-            '`/skip` — пропустити\n'
-            '`/pause` — пауза / відновлення\n'
-            '`/stop` — зупинити та відключитись'
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name='📋 Черга',
-        value=(
-            '`/queue` — показати чергу з кнопками ◀️ ▶️\n'
-            '`/shuffle` — перемішати\n'
-            '`/remove [номер]` — видалити трек\n'
-            '`/clear` — очистити\n'
-            '`/loop` — режим повторення'
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name='✨ Нові в v2',
-        value=(
-            '`/history` — останні 10 зіграних треків\n'
-            '`/autoplay` — авто-додавання схожих треків\n'
-            '`/bassboost` — 🔊 підсилення басів\n'
-            '`/nightcore` — ⚡ прискорення + підвищення тону'
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name='⚙️ Інше',
-        value='`/volume [0-200]` • `/join` • `/leave`\nПрефікс `!` теж працює',
-        inline=False,
-    )
-    embed.set_footer(text='⏱️ Автовідключення через 5 хв • Cookies: ' +
-                    (f'✅ {COOKIE_BROWSER}' if COOKIE_BROWSER else '❌ вимкнено'))
+    embed = make_help_embed()
     await interaction.response.send_message(embed=embed)
 
 
@@ -1442,19 +1522,17 @@ async def _prefix_play(ctx: commands.Context, query: str):
             await vc.move_to(ctx.author.voice.channel)
     else:
         await ctx.author.voice.channel.connect()
-
-    player      = await ensure_player(ctx.guild, ctx.channel, bot)
+    player = await ensure_player(ctx.guild, ctx.channel, bot)
+    if player.radio_mode:
+        await player.stop_radio()
     is_playlist = is_real_playlist(query)
     if not is_playlist:
         query = clean_url(query)
-    msg         = await ctx.send(embed=discord.Embed(description='⏳ Завантажую...', color=COLOR_YELLOW))
-
+    msg = await ctx.send(embed=discord.Embed(description='⏳ Завантажую...', color=COLOR_YELLOW))
     if is_playlist:
         tracks = await fetch_playlist(query, ctx.author)
         player.add_many(tracks)
-        await msg.edit(embed=discord.Embed(
-            description=f'✅ Додано **{len(tracks)}** треків з плейлиста!', color=COLOR_GREEN
-        ))
+        await msg.edit(embed=discord.Embed(description=f'✅ Додано **{len(tracks)}** треків з плейлиста!', color=COLOR_GREEN))
     else:
         track = await fetch_track(query, ctx.author, loop=bot.loop)
         if not track:
@@ -1477,6 +1555,33 @@ async def cmd_play(ctx: commands.Context, *, query: str = None):
         return
     await _prefix_play(ctx, query)
 
+@bot.command(name='radio', aliases=['r'])
+async def cmd_radio(ctx: commands.Context, *, url: str = None):
+    if not ctx.author.voice:
+        await ctx.send(embed=discord.Embed(description='❌ Підключіться до голосового каналу!', color=COLOR_RED))
+        return
+    vc = ctx.voice_client
+    if vc:
+        if vc.channel != ctx.author.voice.channel:
+            await vc.move_to(ctx.author.voice.channel)
+    else:
+        await ctx.author.voice.channel.connect()
+    player = await ensure_player(ctx.guild, ctx.channel, bot)
+    if url:
+        station_name = url[:50]
+        # Перевірити чи це назва станції
+        for name, station_url in RADIO_STATIONS.items():
+            if url.lower() in name.lower():
+                station_name = name
+                url = station_url
+                break
+        await player.start_radio(url, station_name)
+        await ctx.send(embed=discord.Embed(title='📻 Радіо увімкнено', description=f'## {station_name}', color=COLOR_CYAN))
+    else:
+        embed = discord.Embed(title='📻 Радіостанції', description='Оберіть станцію:', color=COLOR_CYAN)
+        view  = RadioView(player, ctx.author)
+        await ctx.send(embed=embed, view=view)
+
 @bot.command(name='skip', aliases=['s', 'next'])
 async def cmd_skip(ctx: commands.Context):
     if ctx.guild.id in players:
@@ -1487,8 +1592,13 @@ async def cmd_skip(ctx: commands.Context):
 async def cmd_stop(ctx: commands.Context):
     gid = ctx.guild.id
     if gid in players:
-        players[gid].clear(); players[gid].skip()
-        await players[gid].destroy(); del players[gid]
+        players[gid].clear()
+        if players[gid].radio_mode:
+            await players[gid].stop_radio()
+        else:
+            players[gid].skip()
+        await players[gid].destroy()
+        del players[gid]
     if ctx.voice_client:
         await ctx.voice_client.disconnect()
     await ctx.send(embed=discord.Embed(description='⏹️ Зупинено!', color=COLOR_RED))
@@ -1515,12 +1625,19 @@ async def cmd_queue(ctx: commands.Context):
 @bot.command(name='np', aliases=['nowplaying', 'now'])
 async def cmd_now(ctx: commands.Context):
     gid = ctx.guild.id
-    if gid not in players or not players[gid].current:
+    if gid not in players:
         await ctx.send('❌ Нічого не грає!'); return
-    track = players[gid].current
-    embed = track.make_embed(filter_name=players[gid].audio_filter)
-    view  = NowPlayingView(players[gid])
-    await ctx.send(embed=embed, view=view)
+    p = players[gid]
+    if p.radio_mode:
+        embed = discord.Embed(title='📻 Радіо — зараз грає', description=f'## {p.radio_station}', color=COLOR_CYAN)
+        view  = RadioNowPlayingView(p)
+        await ctx.send(embed=embed, view=view)
+    elif p.current:
+        embed = p.current.make_embed(filter_name=p.audio_filter)
+        view  = NowPlayingView(p)
+        await ctx.send(embed=embed, view=view)
+    else:
+        await ctx.send('❌ Нічого не грає!')
 
 @bot.command(name='volume', aliases=['vol', 'v'])
 async def cmd_volume(ctx: commands.Context, percent: int = None):
@@ -1556,8 +1673,7 @@ async def cmd_history(ctx: commands.Context):
         await ctx.send('📜 Історія порожня.'); return
     history = players[gid].history[-10:][::-1]
     embed   = discord.Embed(title='📜 Нещодавно грали', color=COLOR_BLUE)
-    lines   = [f'`{i}.` [{t.title[:55]}]({t.webpage_url}) • {t.duration_str}'
-               for i, t in enumerate(history, 1)]
+    lines   = [f'`{i}.` [{t.title[:55]}]({t.webpage_url}) • {t.duration_str}' for i, t in enumerate(history, 1)]
     embed.description = '\n'.join(lines)
     await ctx.send(embed=embed)
 
@@ -1587,28 +1703,13 @@ async def cmd_nightcore(ctx: commands.Context):
 
 @bot.command(name='mix', aliases=['m'])
 async def cmd_mix(ctx: commands.Context, count: str = '10', *, query: str = None):
-    """
-    !mix [кількість] [URL або назва]
-    Приклади:
-      !mix 15 never gonna give you up
-      !mix 5 https://youtu.be/dQw4w9WgXcQ
-      !mix https://youtu.be/VIDEO?list=RDVIDEO  (з Mix URL)
-    """
-    # Якщо count не число — вважаємо що це початок query
     if not count.isdigit():
         query = (count + ' ' + query) if query else count
         count = '10'
     count = max(1, min(int(count), 50))
-
     if not query:
-        await ctx.send(
-            embed=discord.Embed(
-                description='❌ Вкажи URL або назву!\nПриклад: `!mix 15 назва пісні`',
-                color=COLOR_RED,
-            )
-        )
+        await ctx.send(embed=discord.Embed(description='❌ Вкажи URL або назву!\nПриклад: `!mix 15 назва пісні`', color=COLOR_RED))
         return
-
     if not ctx.author.voice:
         await ctx.send(embed=discord.Embed(description='❌ Підключіться до голосового каналу!', color=COLOR_RED))
         return
@@ -1618,36 +1719,20 @@ async def cmd_mix(ctx: commands.Context, count: str = '10', *, query: str = None
             await vc.move_to(ctx.author.voice.channel)
     else:
         await ctx.author.voice.channel.connect()
-
     player = await ensure_player(ctx.guild, ctx.channel, bot)
-    msg    = await ctx.send(
-        embed=discord.Embed(description=f'🎲 Завантажую YouTube Mix ({count} треків)...', color=COLOR_YELLOW)
-    )
-
+    msg    = await ctx.send(embed=discord.Embed(description=f'🎲 Завантажую YouTube Mix ({count} треків)...', color=COLOR_YELLOW))
     tracks = await fetch_mix_tracks(query, ctx.author, count=count)
-
     if not tracks:
-        await msg.edit(embed=discord.Embed(
-            description='❌ Не вдалося завантажити Mix. Спробуй інше відео або запит.',
-            color=COLOR_RED,
-        ))
+        await msg.edit(embed=discord.Embed(description='❌ Не вдалося завантажити Mix.', color=COLOR_RED))
         return
-
     player.add_many(tracks)
-
     preview = '\n'.join(f'`{i}.` {t.title[:55]}' for i, t in enumerate(tracks[:5], 1))
     if len(tracks) > 5:
         preview += f'\n`...` і ще {len(tracks) - 5} треків'
-
-    embed = discord.Embed(
-        title=f'🎲 YouTube Mix — додано {len(tracks)} треків',
-        description=preview,
-        color=COLOR_CYAN,
-    )
+    embed = discord.Embed(title=f'🎲 YouTube Mix — додано {len(tracks)} треків', description=preview, color=COLOR_CYAN)
     if tracks[0].thumbnail:
         embed.set_thumbnail(url=tracks[0].thumbnail)
     await msg.edit(embed=embed)
-
 
 @bot.command(name='autoplay', aliases=['ap'])
 async def cmd_autoplay(ctx: commands.Context):
@@ -1681,11 +1766,7 @@ async def cmd_leave(ctx: commands.Context):
 
 @bot.command(name='help', aliases=['h', 'commands'])
 async def cmd_help(ctx: commands.Context):
-    embed = discord.Embed(title='📖 Команди Music Bot v2', color=COLOR_BLUE)
-    embed.add_field(name='🎵', value='`!play/p` `!skip/s` `!pause` `!stop/dc` `!np`', inline=False)
-    embed.add_field(name='📋', value='`!queue/q` `!shuffle` `!loop` `!vol [0-200]`', inline=False)
-    embed.add_field(name='✨ v2', value='`!history` `!autoplay/ap` `!bassboost/bb` `!nightcore/nc`', inline=False)
-    embed.add_field(name='💡', value='Також є `/slash`-команди — введіть `/` у Discord', inline=False)
+    embed = make_help_embed()
     await ctx.send(embed=embed)
 
 
@@ -1724,10 +1805,7 @@ async def on_voice_state_update(member: discord.Member, before, after):
                     if gid in players:
                         try:
                             await players[gid].text_channel.send(
-                                embed=discord.Embed(
-                                    description='😴 Усі пішли з каналу — відключився.',
-                                    color=COLOR_YELLOW,
-                                )
+                                embed=discord.Embed(description='😴 Усі пішли з каналу — відключився.', color=COLOR_YELLOW)
                             )
                         except Exception:
                             pass
@@ -1739,11 +1817,11 @@ async def on_voice_state_update(member: discord.Member, before, after):
 # ─── on_ready ─────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f'✅ Бот {bot.user} готовий до роботи! (v2)')
+    print(f'✅ Бот {bot.user} готовий до роботи! (v2.1)')
     print(f'   Сервери: {len(bot.guilds)}')
-    print(f'   Cookies: {"✅ " + COOKIE_BROWSER if COOKIE_BROWSER else "❌ вимкнено"}')
+    print(f'   Радіостанцій: {len(RADIO_STATIONS)}')
     await bot.change_presence(
-        activity=discord.Activity(type=discord.ActivityType.listening, name='/play | !play')
+        activity=discord.Activity(type=discord.ActivityType.listening, name='/play | /radio | !play')
     )
     try:
         synced = await bot.tree.sync()
