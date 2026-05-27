@@ -17,7 +17,7 @@ from typing import Optional, List
 
 # ─── Токен та налаштування ───────────────────────────────────────────────────
 import os
-TOKEN = os.environ.get('TOKEN')
+TOKEN = os.environ.get('DISCORD_TOKEN')
 PREFIX = '!'
 INACTIVITY_TIMEOUT = 300  # 5 хвилин без музики → відключення
 
