@@ -57,7 +57,7 @@ _ACTIVE_COOKIE_FILE: Optional[str] = _COOKIES_TMP or COOKIE_FILE
 def _build_ytdl_base() -> dict:
     base = {
         # m4a/webm → HLS fallback → будь-який аудіо → відео+аудіо як крайній варіант
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[protocol=m3u8_native]/bestaudio/best',
+        'format': 'bestaudio/best',
         'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
         'restrictfilenames': True,
         'nocheckcertificate': True,
@@ -67,7 +67,7 @@ def _build_ytdl_base() -> dict:
         'socket_timeout': 15,
         'retries': 3,
         # tv_embedded стабільніший на datacenter IP (Railway), ios як резерв
-        'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'ios']}},
+        'extractor_args': {'youtube': {'player_client': ['android_music', 'tv_embedded', 'ios']}},
     }
     if COOKIE_BROWSER:
         base['cookiesfrombrowser'] = (COOKIE_BROWSER,)
