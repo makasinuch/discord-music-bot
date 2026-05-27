@@ -16,7 +16,8 @@ from discord import app_commands, ui, ButtonStyle
 from typing import Optional, List
 
 # ─── Токен та налаштування ───────────────────────────────────────────────────
-TOKEN = 'MTM0NzE4MDA1NDczNTQ5MTE5NA.GLvb1Y.rWbf82gCfOZlWB1dJgPRzBKTWouxyXRxeNxxEY'
+import os
+TOKEN = os.environ.get('TOKEN')
 PREFIX = '!'
 INACTIVITY_TIMEOUT = 300  # 5 хвилин без музики → відключення
 
