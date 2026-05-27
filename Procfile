@@ -1,1 +1,0 @@
-worker: python music_bot_v2.py
