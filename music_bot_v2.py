@@ -64,6 +64,7 @@ YTDL_OPTIONS = {
     'noplaylist': False,
     'default_search': 'ytsearch',
     'extract_flat': False,
+    'extractor_args': {'youtube': {'player_client': ['ios']}},
 }
 
 YTDL_SEARCH_OPTIONS = {
