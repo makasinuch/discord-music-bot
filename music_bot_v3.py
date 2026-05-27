@@ -56,7 +56,7 @@ _ACTIVE_COOKIE_FILE: Optional[str] = _COOKIES_TMP or COOKIE_FILE
 # ─── YT-DLP налаштування ─────────────────────────────────────────────────────
 def _build_ytdl_base() -> dict:
     base = {
-        'format': 'bestaudio/best',
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
         'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
         'restrictfilenames': True,
         'nocheckcertificate': True,
