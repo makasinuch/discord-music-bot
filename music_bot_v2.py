@@ -17,9 +17,6 @@ from typing import Optional, List
 
 # ─── Токен та налаштування ───────────────────────────────────────────────────
 import os
-print("=== ENV DEBUG ===")
-print("DISCORD_TOKEN:", repr(os.environ.get('DISCORD_TOKEN')))
-print("Всі змінні:", [k for k in os.environ.keys()])
 TOKEN = os.environ.get('DISCORD_TOKEN')
 PREFIX = '!'
 INACTIVITY_TIMEOUT = 300  # 5 хвилин без музики → відключення
@@ -64,7 +61,6 @@ YTDL_OPTIONS = {
     'noplaylist': False,
     'default_search': 'ytsearch',
     'extract_flat': False,
-    'extractor_args': {'youtube': {'player_client': ['ios']}},
 }
 
 YTDL_SEARCH_OPTIONS = {

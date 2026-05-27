@@ -1,0 +1,9 @@
+.venv/
+.idea/
+cookies.txt
+cookies_b64.txt
+nixpacks.toml
+Procfile
+__pycache__/
+*.pyc
+.env
