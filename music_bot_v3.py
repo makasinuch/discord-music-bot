@@ -56,7 +56,8 @@ _ACTIVE_COOKIE_FILE: Optional[str] = _COOKIES_TMP or COOKIE_FILE
 # ─── YT-DLP налаштування ─────────────────────────────────────────────────────
 def _build_ytdl_base() -> dict:
     base = {
-        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best',
+        # m4a/webm → HLS fallback → будь-який аудіо → відео+аудіо як крайній варіант
+        'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[protocol=m3u8_native]/bestaudio/best',
         'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
         'restrictfilenames': True,
         'nocheckcertificate': True,
@@ -65,8 +66,8 @@ def _build_ytdl_base() -> dict:
         'source_address': '0.0.0.0',
         'socket_timeout': 15,
         'retries': 3,
-        # (v3) iOS player client — обхід YouTube bot-detection на datacenter IP
-        'extractor_args': {'youtube': {'player_client': ['ios']}},
+        # tv_embedded стабільніший на datacenter IP (Railway), ios як резерв
+        'extractor_args': {'youtube': {'player_client': ['tv_embedded', 'ios']}},
     }
     if COOKIE_BROWSER:
         base['cookiesfrombrowser'] = (COOKIE_BROWSER,)
